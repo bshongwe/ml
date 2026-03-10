@@ -138,3 +138,11 @@ Features are computed by a separate stream processor (e.g., Flink, Kafka Streams
 - [ ] Implement feature drift detection
 - [ ] Add batch inference pipeline
 - [ ] Create Kubernetes manifests
+
+---
+
+# Reference Repos
+
+1. **Infra:** https://github.com/bshongwe/infra
+2. **Fraud Detection ML System:** https://github.com/bshongwe/ml
+3. **Services:** https://github.com/bshongwe/services
