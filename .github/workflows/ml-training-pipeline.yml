@@ -1,0 +1,249 @@
+name: ML Training Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'training/**'
+      - 'models/**'
+  schedule:
+    # Run weekly retraining
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      retrain_reason:
+        description: 'Reason for retraining'
+        required: true
+        type: choice
+        options:
+          - scheduled
+          - drift_detected
+          - performance_degradation
+          - manual
+
+env:
+  PYTHON_VERSION: '3.11'
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validate Training Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          cd training/fraud-model
+          pip install -r requirements.txt
+          pip install pytest pylint black isort
+      
+      - name: Lint code
+        run: |
+          cd training/fraud-model
+          black --check .
+          isort --check-only .
+          pylint *.py
+      
+      - name: Run unit tests
+        run: |
+          cd training/fraud-model
+          pytest tests/ -v
+      
+      - name: Validate feature schema
+        run: |
+          python -m training.fraud-model.features --validate
+
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Install dependencies
+        run: |
+          cd training/fraud-model
+          pip install -r requirements.txt
+      
+      - name: Download training data
+        run: |
+          aws s3 cp s3://ml-data-lake/silver/transactions/ ./data/ --recursive
+      
+      - name: Train model
+        run: |
+          cd training/fraud-model
+          python train.py \
+            --experiment-name fraud-detection \
+            --run-name "ci-run-${{ github.run_number }}" \
+            --data-path ./data/
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      
+      - name: Evaluate model
+        id: evaluate
+        run: |
+          cd training/fraud-model
+          python evaluate.py --model-path ./models/isolation_forest_v1.joblib
+          echo "metrics=$(cat metrics.json)" >> $GITHUB_OUTPUT
+      
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: model-artifacts
+          path: |
+            models/
+            metrics.json
+      
+      - name: Register model
+        run: |
+          python mlops/model_registry.py register \
+            --model-name fraud_detector \
+            --model-version "v1.${{ github.run_number }}" \
+            --model-path ./models/isolation_forest_v1.joblib \
+            --metrics ./metrics.json
+
+  approve:
+    name: Approve for Production
+    runs-on: ubuntu-latest
+    needs: train
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production-approval
+    steps:
+      - name: Request approval
+        run: echo "Model ready for production deployment"
+      
+      - name: Promote model
+        run: |
+          python mlops/model_registry.py promote \
+            --model-id "fraud_detector_v1.${{ github.run_number }}" \
+            --status production \
+            --approved-by "${{ github.actor }}"
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: train
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Download model artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: model-artifacts
+          path: ./models/
+      
+      - name: Build Docker image
+        run: |
+          cd inference/fraud-api
+          docker build -t fraud-api:staging-${{ github.run_number }} .
+      
+      - name: Push to ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
+          docker tag fraud-api:staging-${{ github.run_number }} \
+            ${{ secrets.ECR_REGISTRY }}/fraud-api:staging-${{ github.run_number }}
+          docker push ${{ secrets.ECR_REGISTRY }}/fraud-api:staging-${{ github.run_number }}
+      
+      - name: Deploy to EKS Staging
+        run: |
+          aws eks update-kubeconfig --name ml-cluster-staging --region ${{ env.AWS_REGION }}
+          kubectl set image deployment/fraud-api \
+            fraud-api=${{ secrets.ECR_REGISTRY }}/fraud-api:staging-${{ github.run_number }} \
+            -n staging
+          kubectl rollout status deployment/fraud-api -n staging
+
+  deploy-production:
+    name: Deploy to Production (Canary)
+    runs-on: ubuntu-latest
+    needs: [approve, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy canary (10% traffic)
+        run: |
+          aws eks update-kubeconfig --name ml-cluster-prod --region ${{ env.AWS_REGION }}
+          kubectl apply -f k8s/fraud-api-canary.yaml
+          kubectl set image deployment/fraud-api-canary \
+            fraud-api=${{ secrets.ECR_REGISTRY }}/fraud-api:staging-${{ github.run_number }} \
+            -n production
+      
+      - name: Monitor canary metrics
+        run: |
+          python mlops/canary_monitor.py \
+            --duration 300 \
+            --error-threshold 0.01 \
+            --latency-threshold 100
+      
+      - name: Promote to full production
+        run: |
+          kubectl set image deployment/fraud-api \
+            fraud-api=${{ secrets.ECR_REGISTRY }}/fraud-api:staging-${{ github.run_number }} \
+            -n production
+          kubectl rollout status deployment/fraud-api -n production
+      
+      - name: Record deployment
+        run: |
+          python mlops/model_registry.py record-deployment \
+            --model-id "fraud_detector_v1.${{ github.run_number }}" \
+            --environment production \
+            --deployed-by "github-actions"
+
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    steps:
+      - name: Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "ML Pipeline Status: ${{ needs.deploy-production.result }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Fraud Detection Model Deployment*\nStatus: ${{ needs.deploy-production.result }}\nVersion: v1.${{ github.run_number }}\nRun: ${{ github.run_number }}"
+                  }
+                }
+              ]
+            }
