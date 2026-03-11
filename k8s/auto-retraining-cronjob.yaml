@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-retraining-check
+  namespace: production
+spec:
+  # Run every hour
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: ml-retraining
+        spec:
+          serviceAccountName: ml-retraining
+          restartPolicy: OnFailure
+          containers:
+          - name: retraining-checker
+            image: ${ECR_REGISTRY}/ml-pipeline:latest
+            imagePullPolicy: Always
+            command:
+            - python
+            - -m
+            - mlops.auto_retraining
+            - --check
+            env:
+            - name: MODEL_NAME
+              value: "fraud_detector"
+            - name: DRIFT_THRESHOLD
+              value: "3"
+            - name: PERFORMANCE_THRESHOLD
+              value: "0.05"
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-credentials
+                  key: tracking_uri
+            - name: AWS_REGION
+              value: "us-east-1"
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "250m"
+              limits:
+                memory: "1Gi"
+                cpu: "500m"
